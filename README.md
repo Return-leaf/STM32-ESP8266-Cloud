@@ -99,10 +99,14 @@ Core/
 ## 开发环境
 
 - **代码生成**：STM32CubeMX（生成初始化代码）
-- **IDE**：VS Code + Cortex-Debug 插件
+- **IDE**：VS Code + STM32CubeIDE for Visual Studio Code 插件
 - **HAL 库**：STM32CubeF4 HAL Driver
 - **编译器**：ARM GCC
 - **烧录**：ST-Link
+
+## 参考资料
+
+- [手把手教你用ESP32连接MQTT云端](https://www.bilibili.com/video/BV14ZuBz8E9x?vd_source=aca89996c2c352a57fb93fe71a097d6b)
 
 ## 使用方法
 
