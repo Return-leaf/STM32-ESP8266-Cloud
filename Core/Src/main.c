@@ -50,41 +50,45 @@ int main(void)
   MX_USART1_UART_Init(); // printf
   MX_USART2_UART_Init(); // ESP8266
 
-  printf("\r\n==== USART2 ESP8266 TEST ====\r\n");
+  printf("\r\n==============================\r\n");
+  printf("  STM32 + ESP8266 + OneNET\r\n");
+  printf("==============================\r\n\r\n");
 
   esp8266_init();
+  printf("[SYS] ESP8266 Reset OK\r\n");
 
-  if (!wifi_test())
-  {
-      printf("ESP8266 ERROR\r\n");
+  if (!wifi_test()) {
+      printf("[ERR] ESP8266 AT Failed!\r\n");
       while(1);
   }
+  printf("[SYS] ESP8266 AT OK\r\n");
 
-  printf("ESP8266 OK\r\n");
-
-  // 连接 WiFi
-  if (!wifi_connect_router())
-  {
-      printf("WiFi Connect FAILED\r\n");
+  printf("[WiFi] Connecting to \"%s\"...\r\n", WIFI_SSID);
+  if (!wifi_connect_router()) {
+      printf("[ERR] WiFi Connect Failed!\r\n");
       while(1);
   }
+  printf("[WiFi] Connected!\r\n");
 
-  // 连接 OneNET MQTT
-  if (!OneNET_MQTT_Init())
-  {
-      printf("MQTT Connect FAILED\r\n");
+  printf("[MQTT] Connecting to OneNET...\r\n");
+  if (!OneNET_MQTT_Init()) {
+      printf("[ERR] MQTT Connect Failed!\r\n");
       while(1);
   }
+  printf("[MQTT] Connected & Subscribed\r\n\r\n");
 
-  printf("==== All Connected, Start Reporting ====\r\n");
+  printf("==============================\r\n");
+  printf("  Start Main Loop\r\n");
+  printf("==============================\r\n\r\n");
 
   int count = 0;
   while(1)
   {
-      printf("---- Report #%d ----\r\n", count);
-      OneNET_Report_Wifi(count);
-      HAL_Delay(3000);
-      OneNET_Report_Event(count);
+      OneNET_Handle_Incoming();
+
+      printf("--- Report #%d ---\r\n", count);
+      OneNET_Report_Property(count);
+
       count++;
       HAL_Delay(5000);
   }
