@@ -98,7 +98,8 @@ Core/
 
 ## 开发环境
 
-- **IDE**：STM32CubeIDE
+- **代码生成**：STM32CubeMX（生成初始化代码）
+- **IDE**：VS Code + Cortex-Debug 插件
 - **HAL 库**：STM32CubeF4 HAL Driver
 - **编译器**：ARM GCC
 - **烧录**：ST-Link
