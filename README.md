@@ -140,7 +140,3 @@ Core/
 ## 已知问题
 
 - 属性设置/获取回复后 MQTT 连接偶尔断开（`+MQTTDISCONNECTED`），可能与 OneNET 平台对回复消息的处理机制有关，后续需要进一步调试。
-
-## License
-
-MIT
