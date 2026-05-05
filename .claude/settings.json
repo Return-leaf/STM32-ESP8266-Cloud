@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(where cmake.exe)",
+      "Bash(where ninja.exe)",
+      "Bash(\"C:/Users/32038/AppData/Local/stm32cube/bundles/cmake/4.2.3+st.1/bin/cmake.exe\" --build \"e:/stm32_8266/stm32_e8266/build/Debug\")",
+      "Bash(\"C:/Users/32038/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-objcopy.exe\" -O binary \"e:/stm32_8266/stm32_e8266/build/Debug/stm32_e8266.elf\" \"e:/stm32_8266/stm32_e8266/build/Debug/stm32_e8266.bin\")",
+      "Bash(nslookup mqttst.heclouds.com)",
+      "Bash(nslookup mqtts.heclouds.com)",
+      "Bash(nslookup mqtt.heclouds.com)",
+      "Read(//c/Users/32038/Desktop/物模型数据交互/**)",
+      "Bash(pip install *)"
+    ]
+  }
+}
