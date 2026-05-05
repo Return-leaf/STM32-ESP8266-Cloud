@@ -1,8 +1,28 @@
+/**
+ * @file    main.c
+ * @brief   STM32F407 + ESP8266 + OneNET MQTT 主程序
+ *
+ * 系统架构：
+ *   STM32F407ZGT6 通过 USART2（PA2/PA3）连接 ESP8266 WiFi 模块，
+ *   ESP8266 通过 AT 指令连接 OneNET 物联网平台的 MQTT 服务。
+ *   每 5 秒上报一次属性值，并监听云端下发的属性设置/获取指令。
+ *
+ * 引脚分配：
+ *   USART1 PA9/PA10  → 调试串口（printf 输出，115200）
+ *   USART2 PA2/PA3   → ESP8266 AT 指令（115200）
+ *   PF6              → ESP8266 RST 复位引脚
+ */
+
 #include "main.h"
 #include "usart.h"
 #include "wifi.h"
 #include <stdio.h>
 
+/* ========================================================================== */
+/*                          printf 重定向                                      */
+/* ========================================================================== */
+
+/* 将 printf 重定向到 USART1（调试串口） */
 #ifdef __GNUC__
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 #else
@@ -14,6 +34,15 @@ PUTCHAR_PROTOTYPE {
   return ch;
 }
 
+/* ========================================================================== */
+/*                          系统时钟配置                                       */
+/* ========================================================================== */
+
+/**
+ * @brief  系统时钟配置
+ *         HSE 8MHz → PLL → SYSCLK 168MHz
+ *         AHB = 168MHz, APB1 = 42MHz, APB2 = 84MHz
+ */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -22,6 +51,7 @@ void SystemClock_Config(void)
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
+  /* HSE 8MHz → PLL ×336/2 = 168MHz */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -41,55 +71,55 @@ void SystemClock_Config(void)
   HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
 }
 
+/* ========================================================================== */
+/*                          主函数                                             */
+/* ========================================================================== */
+
 int main(void)
 {
+  /* 系统初始化 */
   HAL_Init();
   SystemClock_Config();
   MX_GPIO_Init();
 
-  MX_USART1_UART_Init(); // printf
-  MX_USART2_UART_Init(); // ESP8266
+  /* 串口初始化 */
+  MX_USART1_UART_Init();  /* USART1：printf 调试输出 */
+  MX_USART2_UART_Init();  /* USART2：ESP8266 AT 指令 */
 
-  printf("\r\n==============================\r\n");
-  printf("  STM32 + ESP8266 + OneNET\r\n");
-  printf("==============================\r\n\r\n");
-
+  /* ESP8266 硬件复位 */
   esp8266_init();
-  printf("[SYS] ESP8266 Reset OK\r\n");
 
+  /* 测试 AT 指令是否正常 */
   if (!wifi_test()) {
-      printf("[ERR] ESP8266 AT Failed!\r\n");
+      printf("[ERR] AT Failed!\r\n");
       while(1);
   }
-  printf("[SYS] ESP8266 AT OK\r\n");
 
-  printf("[WiFi] Connecting to \"%s\"...\r\n", WIFI_SSID);
+  /* 连接 WiFi 路由器 */
   if (!wifi_connect_router()) {
-      printf("[ERR] WiFi Connect Failed!\r\n");
+      printf("[ERR] WiFi Failed!\r\n");
       while(1);
   }
-  printf("[WiFi] Connected!\r\n");
+  printf("[WiFi] Connected\r\n");
 
-  printf("[MQTT] Connecting to OneNET...\r\n");
+  /* 连接 OneNET MQTT 并订阅 Topic */
   if (!OneNET_MQTT_Init()) {
-      printf("[ERR] MQTT Connect Failed!\r\n");
+      printf("[ERR] MQTT Failed!\r\n");
       while(1);
   }
-  printf("[MQTT] Connected & Subscribed\r\n\r\n");
+  printf("[MQTT] Connected\r\n");
 
-  printf("==============================\r\n");
-  printf("  Start Main Loop\r\n");
-  printf("==============================\r\n\r\n");
-
+  /* ========== 主循环 ========== */
   int count = 0;
   while(1)
   {
+      /* 检查是否有云端下发的 MQTT 消息（属性设置/获取） */
       OneNET_Handle_Incoming();
 
-      printf("--- Report #%d ---\r\n", count);
+      /* 向 OneNET 上报属性值 */
       OneNET_Report_Property(count);
 
       count++;
-      HAL_Delay(5000);
+      HAL_Delay(5000);  /* 每 5 秒上报一次 */
   }
 }
