@@ -190,18 +190,36 @@ STM32-ESP8266-Cloud-main/
 
 ## 编译与烧录
 
-```powershell
-# 工具链路径
-$env:PATH += ";C:\Users\...\gnu-tools-for-stm32\14.3.1+st.2\bin"
-$env:PATH += ";C:\Users\...\ninja\1.13.2+st.1\bin"
+### 环境要求
 
-# 编译
-cd build\Debug
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug ../..
-ninja
+- **IDE**：Keil MDK-ARM (uVision5)，建议 V5.36 及以上
+- **编译器**：ARM Compiler 5 (ARMCC V5.06) 或 ARM Compiler 6
+- **设备包**：Keil.STM32F4xx_DFP (2.15.0 及以上)
+- **调试器**：ST-Link V2
 
-# 烧录
-STM32_Programmer_CLI.exe -c port=SWD -d stm32_e8266.elf -v
+### 编译
+
+1. 用 Keil uVision5 打开 `Projects\MDK-ARM\atk_f407.uvprojx`
+2. 点击 **Build**（F7）编译工程
+3. 编译输出位于 `Output\` 目录，生成 `atk_f407.axf` 和 `atk_f407.hex`
+
+### 烧录
+
+1. 通过 ST-Link 连接探索者 STM32F407 开发板
+2. 在 Keil 中点击 **Download**（F8）即可自动烧录
+3. 或使用 STM32 ST-LINK Utility 烧录 `Output\atk_f407.hex`
+
+### 配置 WiFi 和云平台参数
+
+在 `Drivers\BSP\ESP8266\esp8266.h` 中修改以下宏为你的实际参数：
+
+```c
+#define WIFI_SSID          "YOUR_WIFI_SSID"
+#define WIFI_PWD           "YOUR_WIFI_PASSWORD"
+#define HUAWEI_MQTT_HOST   "YOUR_MQTT_HOST"
+#define HUAWEI_DEVICE_ID   "YOUR_DEVICE_ID"
+#define HUAWEI_DEVICE_PWD  "YOUR_DEVICE_PASSWORD"
+#define HUAWEI_CLIENT_ID   "YOUR_CLIENT_ID"
 ```
 
 ## 许可证
