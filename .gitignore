@@ -1,3 +1,29 @@
-build
-mx.scratch
-!.settings
+﻿# Keil uVision
+*.uvguix.*
+*.uvguix
+*.scvd
+*.uvgui.*
+JLinkLog.txt
+JLinkSettings.ini
+
+# 编译输出
+Output/
+*.o
+*.crf
+*.d
+*.dep
+*.axf
+*.hex
+*.lnp
+*.lst
+*.iex
+*.htm
+*.build_log.htm
+
+# 编译日志
+build_log.txt
+
+# 临时文件
+*.bak
+*.tmp
+*~
