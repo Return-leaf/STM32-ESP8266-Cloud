@@ -44,19 +44,106 @@
 
 在没有操作系统的情况下，ESP8266 的 AT 指令（`wifi_send_cmd`）是阻塞调用，最长可达 20 秒。在此期间 CPU 无法轮询 NRF24L01，导致温度数据丢失。FreeRTOS 将三个任务分离到不同优先级，通过抢占式调度确保 NRF24 数据接收永不间断。
 
+
 ### 状态机设计（WiFi/MQTT 任务）
 
-```
-IDLE → TESTING → CONNECTING → MQTT_INIT → READY
-         ↓           ↓            ↓          ↓
-       AT测试    连接路由器    MQTT连接   定时上报+保活
+#### 为什么要用状态机？
+
+ESP8266 通过 AT 指令与 STM32 通信。AT 指令是阻塞式的——例如 `AT+CWJAP` 连接路由器最长需要等待 15 秒才返回结果。如果在裸机 `while(1)` 循环中直接调用，这 15 秒内 CPU 完全卡死在轮询串口，NRF24L01 无法接收 51 单片机发来的温度数据，导致数据丢失。
+
+FreeRTOS 将系统拆分为三个独立任务，WiFi/MQTT 任务内部采用**非阻塞状态机**：每次进入任务只检查当前状态的一个条件，不符合就立即 `vTaskDelay` 让出 CPU，绝不占用。
+
+```c
+// freertos_demo.c — 核心循环
+for (;;) {
+    switch (g_wifi_state) {
+        case WIFI_STATE_TESTING:    // 每 5 秒试一次 AT
+        case WIFI_STATE_CONNECTING: // 每 3 秒试一次连 WiFi
+        case WIFI_STATE_MQTT_INIT:  // 每 2 秒试一次 MQTT
+        case WIFI_STATE_READY:      // 正常运行：上报 / 心跳 / 接收消息
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // 100ms 后回来，绝不阻塞
+}
 ```
 
-- **TESTING**：每 5 秒发送 AT 测试指令
-- **CONNECTING**：每 3 秒尝试连接 WiFi
-- **MQTT_INIT**：连接后 2 秒发起 MQTT CONNECT
-- **READY**：每 2 秒上报温度，每 60 秒 PING 保活
+#### 五个状态
 
+```
+IDLE (0) → TESTING (1) → CONNECTING (2) → MQTT_INIT (3) → READY (4)
+                ↑ 失败重试              ↑ 失败重试
+```
+
+| 状态 | 含义 | 触发条件 | 执行动作 | 重试间隔 |
+|------|------|---------|---------|---------|
+| `IDLE` | 初始状态 | 任务启动 | 等待 3 秒后进入 TESTING | — |
+| `TESTING` | AT 通信测试 | 每 5 秒 | 发送 `AT\r\n`，期望返回 `OK` | 5 秒 |
+| `CONNECTING` | 连接 WiFi | AT 测试通过 | `AT+CWJAP` 连接路由器 | 3 秒 |
+| `MQTT_INIT` | MQTT 认证 | WiFi 已连接 | TCP 建连 + MQTT CONNECT | 2 秒 |
+| `READY` | 正常工作 | CONNACK rc=0 | 1s 上报 + 60s 心跳 + 1s 收消息 | — |
+
+重试间隔的设计依据：
+- **AT 测试 5 秒** — 指令简单，`wifi_send_cmd` 内部超时仅 2 秒，低频即可
+- **WiFi 连接 3 秒** — `AT+CWJAP` 内部超时 15 秒，太频繁会让路由器反感
+- **MQTT 握手 2 秒** — TCP + CONNECT 约 3-5 秒，2 秒兼顾响应速度和资源消耗
+
+**设计原则：** 状态间必须串行——AT 不通就不连 WiFi，WiFi 没连就不发 MQTT。失败后停留在当前状态重试（不回退，因为前置步骤已验证通过）。
+
+#### 代码实现关键细节
+
+**`lastStep` 计时器防抖**
+
+```c
+case WIFI_STATE_TESTING:
+    if (HAL_GetTick() - lastStep > 5000) {   // 距上次尝试过了 5 秒？
+        if (wifi_test()) {
+            g_wifi_state = WIFI_STATE_CONNECTING;  // 状态跃迁
+        }
+        lastStep = HAL_GetTick();  // 无论成败，都重置计时器
+    }
+    break;
+```
+
+成功和失败都重置 `lastStep`。如果成功不重置，进入下一状态后立即触发超时；如果失败不重置，会在下一个 100ms 循环中疯狂重试。
+
+**`volatile` 跨任务共享**
+
+```c
+static volatile int g_wifi_state = 0;  // 两个 FreeRTOS 任务共享此变量
+```
+
+NRF24 任务也会读 `g_wifi_state`——MQTT 就绪后 15 秒无温度数据则复位 NRF24L01。WiFi 任务写入，NRF24 任务只读，`volatile` 阻止编译器优化到寄存器。本项目只有一个写入者，因此不需要互斥锁。
+
+**READY 状态三个独立定时器**
+
+```c
+case WIFI_STATE_READY:
+    if (HAL_GetTick() - lastPing >= 60000)  { huawei_ping(); }              // 60s 心跳
+    if (HAL_GetTick() - lastReport >= 1000) { huawei_report_temperature(); } // 1s 上报
+    if (HAL_GetTick() - lastIncoming >= 1000) { huawei_handle_incoming(); }  // 1s 收消息
+    break;
+```
+
+各有独立 `lastXxx` 计时器，互不干扰——心跳触发不会推迟温度上报。
+
+**WiFi 任务栈：1024 words (4KB)**
+
+```c
+xTaskCreate(vWiFiMQTTTask, "WiFiMQ", 1024, NULL, 2, NULL);
+```
+
+不是拍脑袋的数字。`huawei_mqtt_connect()` 内部局部变量累计超 800B，加上 `process_incoming_mqtt()` 的 768B 局部缓冲，栈深可达 1.7KB。最初设为 512 words 时，MQTT 连接成功后立即栈溢出，踩坏相邻任务的 TCB，NRF24 和 LCD 任务一起卡死。
+
+#### 常见问题
+
+**Q1：为什么不用事件驱动？** ESP8266 的标准 AT 固件不支持主动通知。它不会在 WiFi 连上后主动发中断——STM32 只能轮询。换 MQTT AT 固件或直接用 ESP32 可实现事件驱动，但属于另一种硬件方案。
+
+**Q2：能跳过某个状态吗？** 技术上可以，但破坏阶段性错误定位能力。保留完整状态链，MQTT 失败时一眼就知道卡在 AT/密码/认证哪一环节。
+
+**Q3：MQTT 断线会自动回退吗？** 当前停留在 READY 重试。更健壮的方案是连续上报失败 3 次后回退到 MQTT_INIT 重连。
+
+**Q4：NRF24 和 ESP8266 都 2.4GHz，不干扰吗？** 排查后发现真正原因是栈溢出（见上），非射频干扰。两模块间距 10cm + NRF24 最低速率可降低误码。
+
+**Q5：volatile 能保证同步吗？** 不能。只保证从内存读，不提供原子性。本项目恰好安全（单写多读）。多写场景必须用信号量或临界区。
 ### NRF24L01 通信协议
 
 51 单片机每 2.5 秒采集并发送一帧 32 字节数据：
