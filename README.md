@@ -144,6 +144,335 @@ xTaskCreate(vWiFiMQTTTask, "WiFiMQ", 1024, NULL, 2, NULL);
 **Q4：NRF24 和 ESP8266 都 2.4GHz，不干扰吗？** 排查后发现真正原因是栈溢出（见上），非射频干扰。两模块间距 10cm + NRF24 最低速率可降低误码。
 
 **Q5：volatile 能保证同步吗？** 不能。只保证从内存读，不提供原子性。本项目恰好安全（单写多读）。多写场景必须用信号量或临界区。
+### 环形缓冲区设计（USART3 + ESP8266）
+
+> 本文档详细说明 STM32-ESP8266-Cloud 项目中 ESP8266 串口通信的环形缓冲区（Ring Buffer）设计——中断生产者 + 任务消费者的无锁架构，以及 AT 指令模式下的"关中断直接轮询"双模切换机制。
+
+
+
+## 1. 背景：ESP8266 的串口通信特点
+
+ESP8266 通过 USART3（PB10/PB11，115200 8N1）与 STM32 通信，使用 AT 指令集。数据收发有以下特点：
+
+**发送方向（STM32 → ESP8266）：** 可控。发送 AT 指令时，知道"什么时候发、发什么、期望收到什么"。
+
+**接收方向（ESP8266 → STM32）：不可控。** ESP8266 何时返回数据完全由它自己决定，STM32 无法预测：
+
+- 发送 `AT\r\n` 后，ESP8266 可能在 1ms 内返回 `OK`，也可能等 2 秒才返回
+- MQTT 连接成功后，服务器随时可能推送消息（命令下发、属性设置）
+- TCP 接收的数据以 `+IPD,<len>:<data>` 格式夹杂在 AT 应答中
+
+**如果不用缓冲区：** 在主循环中轮询 `USART3->DR` 寄存器，每次只读 1 字节。但主循环还要做 NRF24 轮询、LCD 刷新、MQTT 上报——轮询间隔 100ms，ESP8266 可能在两次轮询之间发来几十字节数据，`DR` 寄存器只能存 1 字节（新数据会覆盖旧数据），导致**数据丢失**。
+
+**解决方案：** 用 USART3 的接收中断（RXNE）+ 环形缓冲区。中断每收到 1 字节就存入缓冲区，任务空闲时批量取出处理。中断和任务之间通过 head/tail 指针实现**无锁同步**。
+
+---
+
+## 2. 环形缓冲区的数据结构
+
+```c
+// esp8266.c
+#define UART3_RX_BUF_SIZE 2048                    // 缓冲区容量：2KB
+
+static volatile uint8_t  uart3_rx_buf[UART3_RX_BUF_SIZE];  // 数据存储区
+static volatile uint16_t uart3_rx_head = 0;                // 写指针（生产者：ISR）
+static volatile uint16_t uart3_rx_tail = 0;                // 读指针（消费者：任务）
+```
+
+### 2.1 指针移动规则
+
+```
+初始化：head = 0, tail = 0  （缓冲区空）
+
+写入 1 字节后：head = 1, tail = 0  （1 字节可读）
+写入 5 字节后：head = 5, tail = 0  （5 字节可读）
+读出 3 字节后：head = 5, tail = 3  （2 字节可读）
+
+head == tail  → 缓冲区空
+(head + 1) % SIZE == tail → 缓冲区满（保留 1 字节防止空/满混淆）
+```
+
+### 2.2 为什么是 2048 字节？
+
+ESP8266 的 TCP 透传数据以 `+IPD,<len>:<data>` 格式到达。MQTT 报文最大可达 512 字节（MQTT_BUF_SIZE），加上 `+IPD,4:...` 的头部约 10 字节，单帧约 522 字节。若 FreeRTOS 任务因高优先级任务抢占而来不及读取，可能积压 2-3 帧。2048 字节（约 4 帧 MQTT 报文）提供充足余量。
+
+### 2.3 为什么用 `volatile`？
+
+head 在中断中修改，tail 在任务上下文中修改。两个执行上下文访问同一变量，`volatile` 阻止编译器将其优化到寄存器中，确保每次读写都命中内存。
+
+```
+uint16_t → Cortex-M4 单条 LDR/STR 指令 → 天然原子
+volatile → 阻止编译器优化到寄存器 → 保证跨上下文可见性
+不需要锁 → 头尾分离 + 原子读写 + 单生产者单消费者
+```
+
+---
+
+## 3. 生产者：USART3 中断服务函数
+
+```c
+// esp8266.c
+void USART3_IRQHandler(void)
+{
+    /* 检查 RXNE: 接收缓冲区非空中断标志 */
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE)) {
+        uint8_t ch = (uint8_t)(huart3.Instance->DR & 0xFF);   // 读 DR 寄存器（清 RXNE）
+        uint16_t next = (uart3_rx_head + 1) % UART3_RX_BUF_SIZE; // 计算下一位置
+
+        if (next != uart3_rx_tail) {      // 缓冲区未满？
+            uart3_rx_buf[uart3_rx_head] = ch;  // 存入新字节
+            uart3_rx_head = next;              // head 前移
+        }
+        // 缓冲区满 → 丢弃（不覆盖未读数据）
+    }
+}
+```
+
+### 执行流程
+
+```
+ESP8266 TX ──(1字节)──→ USART3 RX ──(RXNE中断)──→ ISR
+                                                        │
+                                              读 DR → 存入 buf[head] → head++
+                                                        │
+                                              主任务空闲时 ──→ 批量读取
+```
+
+**关键细节：**
+
+1. **清 RXNE 标志：** 读 `DR` 寄存器会自动清除 RXNE。如果不清，中断会反复触发（中断风暴）
+2. **满时丢弃：** `(head+1) % SIZE == tail` 表示缓冲区满。此时新字节被丢弃，而不是覆盖未读数据。这比覆盖旧数据更安全——丢一个字节可能只是某帧校验失败，覆盖则可能破坏多帧
+3. **无锁：** 中断只写 head，任务只写 tail，互不干扰。中断读 tail 只是判断是否满，读到的值即使稍旧（任务刚读完但还没来得及更新 tail）也只会导致"提前判满"，不会数据错误
+
+---
+
+## 4. 消费者 API
+
+三个函数，全部在任务上下文中调用（不会被中断打断的部分）：
+
+```c
+/* 查询缓冲区中可读字节数 */
+uint16_t esp8266_rx_available(void)
+{
+    return (uart3_rx_head - uart3_rx_tail + UART3_RX_BUF_SIZE) % UART3_RX_BUF_SIZE;
+}
+
+/* 清空缓冲区（丢弃所有未读数据） */
+void esp8266_rx_flush(void)
+{
+    uart3_rx_tail = uart3_rx_head;  // 读指针追平写指针 → 逻辑清空
+}
+
+/* 从缓冲区批量读取数据 */
+uint16_t esp8266_rx_read(uint8_t *buf, uint16_t max_len)
+{
+    uint16_t count = 0;
+    while (count < max_len && uart3_rx_tail != uart3_rx_head) {
+        buf[count++] = uart3_rx_buf[uart3_rx_tail];
+        uart3_rx_tail = (uart3_rx_tail + 1) % UART3_RX_BUF_SIZE;
+    }
+    return count;  // 返回实际读出的字节数
+}
+```
+
+**为什么 `available()` 不用锁？** `head` 和 `tail` 都是 `uint16_t`，Cortex-M4 的 16 位读是原子的。即使中断恰好在两次读之间修改了 `head`，最坏情况下返回值略小于实际可用字节数（任务下次再读即可），不会造成数据错误。
+
+---
+
+## 5. 双模切换：关中断直读 vs 缓冲区模式
+
+这是整个设计的**核心巧思**——系统在两种接收模式之间切换，各取所长。
+
+### 模式一：关中断直接轮询（`wifi_send_cmd`）
+
+```c
+int wifi_send_cmd(const char *cmd, const char *expected, uint16_t timeout_ms)
+{
+    static char rx_buf[1024];
+    memset(rx_buf, 0, sizeof(rx_buf));
+
+    esp8266_rx_flush();                         // ① 清空环形缓冲区
+    HAL_NVIC_DisableIRQ(USART3_IRQn);           // ② 关闭 USART3 中断
+    HAL_UART_Transmit(&huart3, cmd, ...);        // ③ 发送 AT 指令
+
+    uint16_t idx = 0;
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < timeout_ms) {
+        if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE)) {
+            rx_buf[idx++] = (uint8_t)(huart3.Instance->DR & 0xFF);
+            start = HAL_GetTick();              // ④ 每收一个字节就刷新超时计时器
+        }
+    }
+    rx_buf[idx] = '\0';
+    HAL_NVIC_EnableIRQ(USART3_IRQn);            // ⑤ 恢复中断
+    return (strstr(rx_buf, expected) != NULL) ? 1 : 0;
+}
+```
+
+**为什么要关中断？** 发送 AT 指令后，需要精准匹配"这条指令的应答"。如果中断也在同时填充环形缓冲区，新数据会混入缓冲区的已有数据中，无法区分哪些字节属于当前应答、哪些是之前的残留。
+
+**为什么要先 flush？** 清空环形缓冲区中的旧数据，防止之前的 AT 应答残留被误读。如果不清，`strstr(rx_buf, "OK")` 可能匹配到上一次指令留下的 `OK`。
+
+**为什么每收到一字节就刷新计时器？** `start = HAL_GetTick()` 实现了**字节间隔超时**（inter-byte timeout），而非总超时。ESP8266 应答可能在 2 秒内断续到达——如果只计时第一次和最后一次，中间停顿 1 秒就会被误判为超时。字节间隔超时保证只要数据还在持续到达就不会超时。
+
+```
+时间轴：
+发送 AT\r\n ───── 收到 'O' ── 等 800ms ── 收到 'K' ── 等 200ms ── 收到 '\r' ── 等 50ms ── 收到 '\n'
+                ↑ start 刷新          ↑ start 刷新         ↑ start 刷新
+                
+如果用总超时：发送后 2 秒不管有没有收到数据都退出 → 可能漏掉后面的字节（✗）
+用字节间隔超时：每次收到字节就重置计时器，只要数据还在来就不超时 → 拿到完整应答（✓）
+```
+
+### 模式二：中断后台接收（`check_mqtt_incoming`）
+
+```c
+static void check_mqtt_incoming(void)
+{
+    uint16_t avail = esp8266_rx_available();
+    if (!avail) return;                         // 无数据，立即返回
+
+    static uint8_t buf[1024];                   // static 避免栈上分配大数组
+    uint16_t n = esp8266_rx_read(buf, sizeof(buf) - 1);
+    if (n) process_incoming_mqtt(buf, n);
+}
+```
+
+MQTT 连接建立后，服务器随时可能推送 CONNACK/PINGRESP/PUBLISH 消息。这些消息**不是对某条 AT 指令的应答**，而是主动推送的。不能关中断轮询（会阻塞整个 WiFi 任务），所以让中断在后台默默接收，任务每 1 秒批量读取一次。
+
+### 双模对比
+
+| 维度 | wifi_send_cmd（关中断直读） | check_mqtt_incoming（缓冲区） |
+|------|---------------------------|----------------------------|
+| **使用场景** | 发送 AT 指令后等应答 | 后台接收 MQTT 推送消息 |
+| **中断状态** | 关闭（`HAL_NVIC_DisableIRQ`） | 开启（ISR 后台填充） |
+| **读取方式** | 逐个轮询 DR 寄存器 | 批量从环形缓冲区读出 |
+| **阻塞性** | 阻塞（最长 timeout_ms） | 非阻塞（无数据直接返回） |
+| **数据来源** | 当前 AT 指令的应答 | 服务器主动推送 |
+| **flush 操作** | 发送前先 flush | 不 flush（数据持续累积） |
+
+---
+
+## 6. MQTT 报文解析链路
+
+完整的数据解析链路（从字节到业务逻辑）：
+
+```
+ESP8266 ──(TCP)──→ USART3 ──(RXNE中断)──→ 环形缓冲区
+                                              │
+                           check_mqtt_incoming() 每 1s 调用
+                                              │
+                              esp8266_rx_read() 批量读取
+                                              │
+                           process_incoming_mqtt() 逐帧解析
+                            ┌─────────┬─────────┐
+                            │         │         │
+                         0x20      0x30      0xD0
+                        CONNACK   PUBLISH   PINGRESP
+                        (rc=0)   (命令/属性) (心跳响应)
+```
+
+**`process_incoming_mqtt()` 解析逻辑：**
+
+```c
+static void process_incoming_mqtt(const uint8_t *data, uint16_t len) {
+    uint16_t pos = 0;
+    while (pos < len) {
+        uint8_t type = data[pos] >> 4;      // 高 4 位 = 报文类型
+        // 读取变长剩余长度（1-4 字节）
+        uint32_t rl = 0;
+        do {
+            uint8_t b = data[++pos];
+            rl = (rl << 7) | (b & 0x7F);
+        } while (b & 0x80);                 // 最高位=1 表示还有后续字节
+
+        switch (type) {
+            case 0x20:  // CONNACK → 记录返回码 rc
+            case 0x30:  // PUBLISH → 提取 Topic + Payload，打印日志
+            case 0xD0:  // PINGRESP → 连接正常
+        }
+        pos += rl;                          // 跳到下一帧
+    }
+}
+```
+
+**为什么需要手动构建和解析 MQTT 报文？** 本项目用的是 ESP8266 标准 AT 固件（而非 MQTT AT 固件），ESP8266 只提供 TCP 透传（`AT+CIPSEND` 发送原始字节、`+IPD` 接收原始字节），不提供 MQTT 协议的封装/解析。所有 MQTT 报文（CONNECT/PUBLISH/PINGREQ/SUBSCRIBE）都需要在 STM32 端手动构建和解析。这是轻量级嵌入式设备中非常常见的做法。
+
+---
+
+## 7. 踩坑记录
+
+### 坑 1：+IPD 数据与 SEND OK 同帧到达
+
+**现象：** MQTT CONNECT 发送后，`tcp_send_data()` 只匹配 `SEND OK`，CONNACK 报文被忽略。
+
+**原因：** ESP8266 的 `AT+CIPSEND` 应答格式为：
+
+```
+SEND OK\r\n\r\n+IPD,4:\x20\x02\x00\x00
+```
+
+`SEND OK` 和 `+IPD(CONNACK)` 在**同一帧**中到达。如果只检查 `SEND OK` 而忽略后面的 `+IPD`，CONNACK 就丢了。
+
+**解决：** `tcp_send_data()` 在匹配到 `SEND OK` 后，继续在当前 `rx_buf` 中搜索 `+IPD,`，如果找到就立即解析：
+
+```c
+// tcp_send_data() 内部
+int ret = (strstr(rx, "SEND OK") != NULL) ? 1 : 0;
+
+/* !! 关键 !! SEND OK 和 +IPD(CONNACK) 可能在同一帧 */
+char *ipd = strstr(rx, "+IPD,");
+if (ipd) {
+    int il = 0;
+    sscanf(ipd, "+IPD,%d:", &il);
+    char *pl = strchr(ipd, ':');
+    if (pl && il > 0) {
+        pl++;
+        process_incoming_mqtt((uint8_t *)pl, (uint16_t)il);
+    }
+}
+return ret;
+```
+
+### 坑 2：环形缓冲区不是"万能缓冲"
+
+环形缓冲区只在**中断接收模式**下工作。`wifi_send_cmd()` 关中断后，所有到达的字节都会丢失（因为 ISR 被屏蔽了，DR 寄存器的数据被覆盖）。这就是为什么 `wifi_send_cmd` 必须在 100ms 任务循环中调用——任务每 100ms 轮一次，`wifi_send_cmd` 阻塞期间（最长 20 秒），高优先级的 NRF24 任务可以抢占，但 USART3 中断被关闭，后台数据会丢失。
+
+**这实际上是个合理的设计取舍：** AT 指令应答期间不需要后台接收（MQTT 推送只会发生在连接建立后），关中断保证应答匹配的准确性。
+
+---
+
+## 8. 常见问题
+
+### Q1：为什么不用 HAL 的 `HAL_UART_Receive_IT()` 而要手写环形缓冲区？
+
+`HAL_UART_Receive_IT()` 需要预先指定接收长度。比如指定 100 字节，收到 100 字节后才触发完成回调。ESP8266 的应答长度完全不可预测——AT 应答可能只有 2 字节（`OK`），TCP 数据可能达 500 字节。手写环形缓冲区可以处理**不定长数据流**，每来 1 字节就存 1 字节，上层随时可以取出任意长度。
+
+### Q2：缓冲区满时丢数据，会不会丢 MQTT 关键报文？
+
+可能。如果 MQTT PUBLISH 报文在缓冲区满时到达，确实会被丢弃。华为云 IoT 平台对 QoS 1 报文有重传机制——服务器未收到 PUBACK 会重发。但在本项目当前实现中，MQTT PUBLISH 使用的是 QoS 0，丢失后不会重传。**增大缓冲区到 2048 字节 + 1 秒一次 `check_mqtt_incoming()` 已经大幅降低了丢数据的概率。**
+
+### Q3：为什么缓冲区要保留 1 字节（head+1 == tail 判满）？
+
+如果不保留，`head == tail` 既可能表示"空"也可能表示"满"。用 `(head+1) % SIZE == tail` 判满，代价是牺牲 1 字节容量，换来空/满判断的 O(1) 复杂度（不需要额外计数器）。在 2048 字节的缓冲区中牺牲 1 字节完全可以接受。
+
+### Q4：`wifi_send_cmd` 的 `rx_buf` 为什么用 `static`？
+
+```c
+static char rx_buf[1024];  // 1024 字节，static 分配在 .bss 段而非栈上
+```
+
+1024 字节的局部数组如果放在栈上，会大大增加调用者的栈压力。`static` 将其移到 `.bss` 段（全局静态存储区），不占栈空间。代价是函数不可重入——但在本项目单任务架构下无关紧要。
+
+### Q5：为什么不直接在中断中解析 MQTT 报文？
+
+中断服务函数应该尽可能短（嵌入式开发的基本准则）。MQTT 报文解析涉及变长剩余长度解码、多字节比较、字符串匹配，在中断中执行会显著延长中断响应时间，可能导致其他中断丢失。将解析推迟到任务上下文，中断只做"收字节 → 存缓冲区"这一件事（约 10 条指令），耗时 < 1μs。
+
+---
+
+> **一句话总结：** USART3 用中断 + 环形缓冲区解耦 ESP8266 的异步数据到达和任务的批量处理。AT 指令应答期间切换到关中断直读模式保证应答精准匹配；MQTT 推送消息由中断后台接收、任务定期批量取出解析。head/tail 分离的无锁设计在 Cortex-M4 的原子读写支持下无需互斥锁。
+
+
 ### NRF24L01 通信协议
 
 51 单片机每 2.5 秒采集并发送一帧 32 字节数据：
